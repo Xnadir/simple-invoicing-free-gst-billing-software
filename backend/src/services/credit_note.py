@@ -25,6 +25,7 @@ from src.services.gst_tax_service import (
 )
 from src.services.inventory_service import InventoryManager
 from src.services.company_access import company_scope
+from src.services.invoice_discounts import apportion_invoice_discount, invoice_discount_amount
 
 
 def _return_note(credit_note_number: str) -> str:
@@ -107,6 +108,54 @@ def _credited_on_invoice(db: Session, invoice_id: int, company_id: int | None) -
         query = query.filter(company_scope(CreditNote.company_id, company_id))
     lines, tcs = query.one()
     return Decimal(str(lines or 0)), Decimal(str(tcs or 0))
+
+
+def _discounted_line_amounts(invoice: Invoice) -> dict[int, tuple[Decimal, Decimal]]:
+    """Each line's taxable and tax amount after sharing out an invoice-level discount.
+
+    ``InvoiceItem.taxable_amount``/``tax_amount`` are already net of any *line*
+    discount but never an invoice-level one — ``InvoiceProcessor._apply_totals``
+    takes that off the GST-inclusive raw total without touching stored line
+    figures (see ``apportion_invoice_discount`` in ``invoice_discounts.py``,
+    which reports use to recover it). A return note built straight from those
+    stored figures would credit the undiscounted amount, more than the
+    customer was ever billed (#797).
+
+    ``apportion_invoice_discount`` gives each line its pro-rata ex-GST share of
+    the discount, dropping the GST portion of it (for reports, that GST was
+    never collected, so it is not revenue). A credit note needs that GST
+    portion back, since a full return must credit exactly what was billed
+    including tax: this scales each line's *tax* down by the same fraction its
+    taxable value lost, which keeps the line's own GST rate and reproduces the
+    invoice's total_amount exactly, since the discount was a single amount off
+    the whole document and apportioning it pro-rata by taxable value makes
+    that fraction identical for every line.
+    """
+    items = list(invoice.items)
+    fallback = {item.id: (Decimal(str(item.taxable_amount or 0)), Decimal(str(item.tax_amount or 0))) for item in items}
+
+    discount = invoice_discount_amount(invoice)
+    if discount <= 0 or not items:
+        return fallback
+
+    taxables = [Decimal(str(item.taxable_amount or 0)) for item in items]
+    shares = apportion_invoice_discount(
+        taxables,
+        invoice_discount=discount,
+        invoice_tax=Decimal(str(invoice.total_tax_amount or 0)),
+    )
+
+    result: dict[int, tuple[Decimal, Decimal]] = {}
+    for item, taxable, share in zip(items, taxables, shares):
+        tax = Decimal(str(item.tax_amount or 0))
+        if taxable > 0 and share > 0:
+            discounted_taxable = _money(taxable - share)
+            discounted_tax = _money(tax * discounted_taxable / taxable)
+        else:
+            discounted_taxable = _money(taxable)
+            discounted_tax = _money(tax)
+        result[item.id] = (discounted_taxable, discounted_tax)
+    return result
 
 
 def _assign_tcs_shares(
@@ -420,6 +469,12 @@ def create_credit_note(
     igst_total = Decimal("0")
     built_items = []
     new_credit: dict[int, Decimal] = {}
+    # Lazily-built, per-invoice: each line's taxable/tax after sharing out any
+    # invoice-level discount. A return must not credit more than the line was
+    # actually billed for, so this caps it instead of the undiscounted
+    # ii.line_total (#797).
+    discounted_amounts_cache: dict[int, dict[int, tuple[Decimal, Decimal]]] = {}
+    discounted_line_limits: dict[int, Decimal] = {}
 
     for cn_item in payload.items:
         ii = invoice_item_map[cn_item.invoice_item_id]
@@ -446,6 +501,16 @@ def create_credit_note(
             if not line_taxable and not line_tax:
                 # Rows from before the tax columns carry only their total.
                 line_taxable = Decimal(str(ii.line_total or 0))
+                discounted_limit = Decimal(str(ii.line_total or 0))
+            else:
+                invoice = invoice_map[cn_item.invoice_id]
+                if invoice.id not in discounted_amounts_cache:
+                    discounted_amounts_cache[invoice.id] = _discounted_line_amounts(invoice)
+                line_taxable, line_tax = discounted_amounts_cache[invoice.id].get(
+                    ii.id, (line_taxable, line_tax)
+                )
+                discounted_limit = _money(line_taxable + line_tax)
+            discounted_line_limits[ii.id] = discounted_limit
             whole = Decimal(str(ii.quantity))
             before = returned_before[ii.id]
             taxable = _pro_rata(line_taxable, before, quantity, whole)
@@ -454,9 +519,12 @@ def create_credit_note(
             returned_before[ii.id] = before + quantity
             # The goods can still come back when earlier notes have used up part of
             # the line's value, as a discount note does. They bring back only what
-            # is left of it, and the note carries nothing once none is.
+            # is left of it, and the note carries nothing once none is. The limit is
+            # the line's share after any invoice-level discount, not its undiscounted
+            # line_total, so a discounted invoice's return can't credit more than it
+            # billed (#797).
             remaining = max(
-                _money(Decimal(str(ii.line_total or 0)))
+                discounted_limit
                 - _credited_on_line(db, ii.id, company_id)
                 - new_credit.get(ii.id, Decimal("0")),
                 Decimal("0"),
@@ -518,7 +586,12 @@ def create_credit_note(
     tolerance = Decimal("0") if payload.credit_note_type == "discount" else Decimal("0.01")
     for item_id, credit in new_credit.items():
         credited = _credited_on_line(db, item_id, company_id)
-        limit = _money(Decimal(str(invoice_item_map[item_id].line_total or 0)))
+        # A discount note's limit is still the undiscounted line_total (it
+        # credits a requested inclusive amount, unrelated to any invoice-level
+        # discount); a return's limit is what that discount left to credit.
+        limit = discounted_line_limits.get(
+            item_id, _money(Decimal(str(invoice_item_map[item_id].line_total or 0)))
+        )
         if credited + credit > limit + tolerance:
             raise HTTPException(
                 status_code=400,

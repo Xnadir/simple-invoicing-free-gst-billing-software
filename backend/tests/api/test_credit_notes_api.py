@@ -523,6 +523,71 @@ def test_return_of_a_discounted_line_credits_its_line_total(client, gst_seller, 
     assert float(_stored(db_session, note).total_amount) == line["line_total"]
 
 
+def test_full_return_of_an_invoice_level_discount_credits_what_was_billed(client, gst_seller):
+    """#797: a 10% invoice-level discount on 1,000 @ 18% GST bills 1,062.00, not 1,180.00.
+
+    The invoice keeps its stored taxable (1,000) and tax (180) — the discount
+    never touches them. A full return must still credit only 1,062.00, split
+    as 900.00 taxable / 162.00 tax: the same 90% of the GST-inclusive total
+    the customer actually paid, at the line's own 18% rate.
+    """
+    invoice = _sale(
+        client,
+        {"quantity": 1, "unit_price": 1000, "gst_rate": 18},
+        discount_type="percentage", discount_value=10,
+    )
+    assert invoice["total_amount"] == 1062.00
+
+    note = _note(client, invoice, quantity=1).json()
+
+    assert note["total_amount"] == 1062.00
+    assert note["taxable_amount"] == 900.00
+    assert (note["cgst_amount"], note["sgst_amount"]) == (81.00, 81.00)
+    assert note["items"][0]["taxable_amount"] == 900.00
+    assert note["items"][0]["tax_amount"] == 162.00
+
+    statement = client.get(
+        f"/api/ledgers/{invoice['ledger_id']}/statement",
+        params={"from_date": "1990-01-01", "to_date": "2999-12-31"},
+    )
+    assert statement.status_code == 200, statement.text
+    assert statement.json()["closing_balance"] == 0
+
+
+def test_two_half_returns_of_a_discounted_invoice_add_up_to_its_total(client, gst_seller):
+    """#797: partial returns must split the same discounted amount, not the undiscounted one."""
+    invoice = _sale(
+        client,
+        {"quantity": 2, "unit_price": 1000, "gst_rate": 18},
+        discount_type="percentage", discount_value=10,
+    )
+
+    first = _note(client, invoice, quantity=1).json()
+    second = _note(client, invoice, quantity=1).json()
+
+    assert first["total_amount"] + second["total_amount"] == pytest.approx(invoice["total_amount"])
+
+    statement = client.get(
+        f"/api/ledgers/{invoice['ledger_id']}/statement",
+        params={"from_date": "1990-01-01", "to_date": "2999-12-31"},
+    )
+    assert statement.json()["closing_balance"] == 0
+
+
+def test_fixed_invoice_discount_return_does_not_over_credit(client, gst_seller):
+    """A flat (non-percentage) invoice-level discount must be honoured too."""
+    invoice = _sale(
+        client,
+        {"quantity": 1, "unit_price": 1000, "gst_rate": 18},
+        discount_type="net", discount_value=118,
+    )
+    assert invoice["total_amount"] == 1062.00
+
+    note = _note(client, invoice, quantity=1).json()
+
+    assert note["total_amount"] == 1062.00
+
+
 def test_partial_return_credits_its_share_of_the_line(client, gst_seller):
     invoice = _sale(client, {"quantity": 10, "unit_price": 99.99, "gst_rate": 18})
     line = invoice["items"][0]
