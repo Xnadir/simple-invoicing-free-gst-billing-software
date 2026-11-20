@@ -13,8 +13,8 @@ from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
-import weasyprint
-from src.services.pdf_render import safe_url_fetcher
+from src.services.pdf_paper import Paper, is_thermal, render_pdf, resolve_paper
+from src.services.pdf_templates.thermal_template import build_thermal_copies, thermal_invoice_doc
 
 from src.db.session import get_db
 from src.models.company_account import CompanyAccount
@@ -38,7 +38,9 @@ from src.services.financial_year import get_active_fy, get_fy_for_date
 from src.services.gst_tax_service import india_today
 from src.services.invoice_payments import (
     build_invoice_payment_summaries,
+    invoice_has_active_payment_allocations,
     invoice_has_tds_allocated,
+    payment_allocated_to_invoice,
     outstanding_due_invoices as _outstanding_due_invoices,
 )
 from src.services.pdf_templates import (
@@ -726,6 +728,27 @@ def update_invoice(
                 ),
             )
 
+        # A receipt or payment settles against this invoice's current ledger.
+        # Moving the invoice to a different party would leave the allocation
+        # pointing at the wrong customer/supplier with nothing to notice —
+        # the same state validate_payment_allocations already refuses from
+        # the payment side (#786).
+        if payload.ledger_id != invoice.ledger_id and invoice_has_active_payment_allocations(
+            db, invoice.id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This invoice has receipts allocated to it. Remove them from "
+                    "the receipt first."
+                    if invoice.voucher_type == "sales"
+                    else (
+                        "This invoice has payments allocated to it. Remove them "
+                        "from the payment first."
+                    )
+                ),
+            )
+
         active_fy = get_active_fy(db, company_id=active_company.id)
 
         # The invoice's financial year and number series are fixed at
@@ -832,20 +855,28 @@ def update_invoice(
 
 
 
-def _build_invoice_pdf(invoice: Invoice, products: list[Product], invoice_bank_accounts: list[CompanyAccount], active_company: CompanyProfile | None = None, serials: dict[int, list[str]] | None = None, pay_qr_html: str = "", settlement: dict[str, float] | None = None) -> BytesIO:
+def _build_invoice_pdf(invoice: Invoice, products: list[Product], invoice_bank_accounts: list[CompanyAccount], active_company: CompanyProfile | None = None, serials: dict[int, list[str]] | None = None, pay_qr_html: str = "", settlement: dict[str, float] | None = None, paper: Paper = "a4", qr_uri: str = "") -> BytesIO:
+    """One copy of an invoice as a PDF. ``qr_uri`` is the pay QR for the thermal layout."""
+    if is_thermal(paper):
+        doc = thermal_invoice_doc(
+            invoice,
+            products,
+            bank_accounts=invoice_bank_accounts,
+            copy_label="" if invoice.voucher_type == "purchase" else _copy_label(1),
+            serials=serials,
+            qr_uri=qr_uri,
+            settlement=settlement,
+        )
+        return BytesIO(render_pdf(build_thermal_copies([doc], paper), paper))
     show_sku = active_company.show_sku_on_pdf if active_company else True
-    html = _build_invoice_html(invoice, products, invoice_bank_accounts, copy_label=_copy_label(1), show_sku=show_sku, serials=serials, pay_qr_html=pay_qr_html, settlement=settlement)
-    pdf_bytes = weasyprint.HTML(string=html, url_fetcher=safe_url_fetcher).write_pdf()
-    buf = BytesIO(pdf_bytes)
-    return buf
+    html = _build_invoice_html(invoice, products, invoice_bank_accounts, copy_label=_copy_label(1), show_sku=show_sku, serials=serials, pay_qr_html=pay_qr_html, settlement=settlement, paper=paper)
+    return BytesIO(render_pdf(html, paper))
 
 
 def _build_multi_copy_invoice_pdf(invoice: Invoice, products: list[Product], invoice_bank_accounts: list[CompanyAccount], copies: int, active_company: CompanyProfile | None = None, serials: dict[int, list[str]] | None = None, pay_qr_html: str = "", settlement: dict[str, float] | None = None) -> BytesIO:
     show_sku = active_company.show_sku_on_pdf if active_company else True
     html = _build_multi_copy_invoice_html(invoice, products, invoice_bank_accounts, copies, show_sku=show_sku, serials=serials, pay_qr_html=pay_qr_html, settlement=settlement)
-    pdf_bytes = weasyprint.HTML(string=html, url_fetcher=safe_url_fetcher).write_pdf()
-    buf = BytesIO(pdf_bytes)
-    return buf
+    return BytesIO(render_pdf(html))
 
 
 @router.get("/{invoice_id}/pdf")
@@ -853,6 +884,7 @@ def download_invoice_pdf(
     invoice_id: int,
     request: Request,
     copies: int = Query(default=1, ge=1, le=10),
+    paper: Paper | None = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     active_company: CompanyProfile = Depends(get_active_company),
@@ -874,7 +906,12 @@ def download_invoice_pdf(
         )
 
     pdf_buffer = render_invoice_pdf(
-        db, active_company.id, invoice_id, copies=copies, share_url=share_url
+        db,
+        active_company.id,
+        invoice_id,
+        copies=copies,
+        share_url=share_url,
+        paper=resolve_paper(paper, active_company),
     )
     filename = f"invoice_{invoice.invoice_number or invoice.id}.pdf"
 
@@ -937,6 +974,17 @@ def cancel_invoice(
             raise HTTPException(
                 status_code=400,
                 detail=f"TDS is recorded against this invoice. Remove the TDS from the {side} first, then cancel the invoice.",
+            )
+        # A receipt/payment still allocated here would be left pointing at a
+        # cancelled invoice: it couldn't be saved again, and the allocation
+        # couldn't be removed from the page either (#792).
+        allocated_payment = payment_allocated_to_invoice(db, invoice.id)
+        if allocated_payment is not None:
+            side = "receipt" if allocated_payment.voucher_type == "receipt" else "payment"
+            voucher_number = allocated_payment.payment_number or allocated_payment.id
+            raise HTTPException(
+                status_code=400,
+                detail=f"Remove this invoice from {side} {voucher_number} first",
             )
         processor = InvoiceProcessor(db)
         # Serials first: cancelling a purchase whose units are already sold is

@@ -57,6 +57,7 @@ from src.services.quotation import (
     set_quotation_status,
     update_quotation,
 )
+from src.services.pdf_paper import Paper, resolve_paper
 from src.services.share_documents import render_quotation_pdf
 
 logger = logging.getLogger(__name__)
@@ -428,6 +429,7 @@ def convert(
 @router.get("/{quotation_id}/pdf")
 def download_pdf(
     quotation_id: int,
+    paper: Paper | None = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     active_company: CompanyProfile = Depends(get_active_company),
@@ -435,7 +437,9 @@ def download_pdf(
     # Rendered in src/services/share_documents so the owner's copy and the one a
     # customer downloads from a share link are the same document.
     quotation = require_quotation(db, active_company.id, quotation_id)
-    pdf_buffer = render_quotation_pdf(db, active_company.id, quotation_id)
+    pdf_buffer = render_quotation_pdf(
+        db, active_company.id, quotation_id, paper=resolve_paper(paper, active_company)
+    )
     number = quotation.quotation_number.replace("/", "_")
     track(
         "quotation_pdf_downloaded",

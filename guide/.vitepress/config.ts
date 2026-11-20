@@ -118,6 +118,7 @@ export default defineConfig({
         text: 'Settings',
         items: [
           { text: 'Overview', link: '/settings/' },
+          { text: 'Printing and paper size', link: '/settings/printing' },
           { text: 'Email', link: '/settings/email' },
           { text: 'Backups', link: '/settings/backups' },
         ],

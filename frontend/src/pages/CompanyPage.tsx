@@ -12,7 +12,8 @@ import { useFirstInvoiceTourStore } from '../store/useFirstInvoiceTourStore';
 import { INVOICE_PATH } from '../features/firstInvoiceTour/tourSteps';
 import { setupPromptChoices } from '../utils/setupPrompt';
 import { useFY } from '../context/FYContext';
-import type { CompanyProfile, CompanyProfileUpdate, InvoiceSeries, InvoiceSeriesUpdate, CompanyTermOut } from '../types/api';
+import { PAPER_LABELS } from '../utils/paper';
+import type { CompanyProfile, CompanyProfileUpdate, InvoiceSeries, InvoiceSeriesUpdate, CompanyTermOut, PdfPaper } from '../types/api';
 import { clearSetupDraft, isCompanyConfigured, isCompanyFormDirty, missingCompanyFields, readSetupDraft, writeSetupDraft, type MissingCompanyFields } from '../utils/companySetup';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { isCurrencyChange } from '../utils/currencyChange';
@@ -758,6 +759,7 @@ export default function CompanyPage() {
     email: '',
     website: '',
     show_sku_on_pdf: false,
+    default_pdf_paper: 'a4' as PdfPaper,
     eway_enabled: true,
     eway_local_threshold: 50000,
     eway_interstate_threshold: 50000,
@@ -816,6 +818,7 @@ export default function CompanyPage() {
         email: data.email || '',
         website: data.website || '',
         show_sku_on_pdf: data.show_sku_on_pdf || false,
+        default_pdf_paper: data.default_pdf_paper || 'a4',
         eway_enabled: data.eway_enabled ?? true,
         eway_local_threshold: data.eway_local_threshold ?? 50000,
         eway_interstate_threshold: data.eway_interstate_threshold ?? 50000,
@@ -917,6 +920,7 @@ export default function CompanyPage() {
         email: form.email.trim(),
         website: form.website.trim(),
         show_sku_on_pdf: form.show_sku_on_pdf,
+        default_pdf_paper: form.default_pdf_paper,
         eway_enabled: form.eway_enabled,
         eway_local_threshold: form.eway_local_threshold,
         eway_interstate_threshold: form.eway_interstate_threshold,
@@ -952,6 +956,7 @@ export default function CompanyPage() {
       if (initialSetupRequired && payload.name) {
         setShowFirstSetupPrompt(true);
       }
+      await queryClient.invalidateQueries({ queryKey: ['company', 'profile'] });
       setIdentityErrors({});
       await loadCompanyProfile();
       const next = pendingNavRef.current;
@@ -1341,6 +1346,22 @@ export default function CompanyPage() {
                   </div>
                   <small className="field-hint" style={{ marginLeft: '24px' }}>
                     When disabled, SKU is hidden and the item description gets more horizontal space.
+                  </small>
+                </div>
+
+                <div className="field">
+                  <label htmlFor="company-default-paper">Default paper size</label>
+                  <select
+                    id="company-default-paper"
+                    value={form.default_pdf_paper}
+                    onChange={(e) => setForm((current) => ({ ...current, default_pdf_paper: e.target.value as PdfPaper }))}
+                  >
+                    {(Object.keys(PAPER_LABELS) as PdfPaper[]).map((paper) => (
+                      <option key={paper} value={paper}>{PAPER_LABELS[paper]}</option>
+                    ))}
+                  </select>
+                  <small className="field-hint">
+                    The paper used for downloads, emails and share links. Thermal applies to bills, receipts, notes, challans and quotations; reports fall back to A4.
                   </small>
                 </div>
 

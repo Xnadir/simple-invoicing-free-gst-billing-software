@@ -18,6 +18,7 @@ from .builders import (
     _build_pdf_tax_row_cells,
     _build_tcs_html,
     _e,
+    document_paper_css,
     _fmt_currency,
     _pdf_display_quantity,
     _pdf_display_unit,
@@ -40,14 +41,16 @@ def _copy_label(n: int) -> str:
     return f"{n}{suffix} Copy"
 
 
-def _build_invoice_html(invoice: Invoice, products: list[Product], invoice_bank_accounts: list[CompanyAccount] | None = None, copy_label: str = "Original", show_sku: bool = True, serials: dict[int, list[str]] | None = None, pay_qr_html: str = "", settlement: dict[str, float] | None = None) -> str:
-    """Generate HTML for a sales invoice."""
+def _build_invoice_html(invoice: Invoice, products: list[Product], invoice_bank_accounts: list[CompanyAccount] | None = None, copy_label: str = "Original", show_sku: bool = True, serials: dict[int, list[str]] | None = None, pay_qr_html: str = "", settlement: dict[str, float] | None = None, paper: str = "a4") -> str:
+    """Generate HTML for a sales invoice, laid out for A4 or A5 ``paper``."""
     if invoice_bank_accounts is None:
         invoice_bank_accounts = []
     
     if invoice.voucher_type == "purchase":
-        return _build_purchase_invoice_html(invoice, products, serials, settlement=settlement)
+        return _build_purchase_invoice_html(invoice, products, serials, settlement=settlement, paper=paper)
 
+    compact = paper == "a5"
+    page_rule, paper_css = document_paper_css(paper)
     currency = invoice.company_currency_code or "USD"
     voucher_label = "Sales" if invoice.voucher_type == "sales" else "Purchase"
     inv_number = invoice.invoice_number or f"#{invoice.id}"
@@ -74,8 +77,8 @@ def _build_invoice_html(invoice: Invoice, products: list[Product], invoice_bank_
         source_challan_line = (
             f"<p>Against delivery challan {_e(source_challan.challan_number)}{challan_date}</p>"
         )
-    tax_header_cells = _build_pdf_tax_header_cells(interstate_supply)
-    table_colgroup = _build_pdf_table_colgroup(interstate_supply, show_sku=show_sku)
+    tax_header_cells = _build_pdf_tax_header_cells(interstate_supply, compact=compact)
+    table_colgroup = _build_pdf_table_colgroup(interstate_supply, show_sku=show_sku, compact=compact)
 
     product_map = {p.id: p for p in products}
     serials_map = serials or {}
@@ -94,7 +97,7 @@ def _build_invoice_html(invoice: Invoice, products: list[Product], invoice_bank_
         hsn = _e(item.hsn_sac or (prod.hsn_sac if prod else None) or "N/A")
         unit = _e(_pdf_display_unit(getattr(prod, "unit", None) if prod else None))
         quantity_display = _pdf_display_quantity(item.quantity, getattr(prod, "allow_decimal", None) if prod else None)
-        tax_row_cells = _build_pdf_tax_row_cells(item, currency, interstate_supply)
+        tax_row_cells = _build_pdf_tax_row_cells(item, currency, interstate_supply, compact=compact)
 
         item_discount_html = _build_item_discount_html(item, currency, tax_inclusive=tax_inclusive)
 
@@ -242,10 +245,7 @@ def _build_invoice_html(invoice: Invoice, products: list[Product], invoice_bank_
 <head>
 <meta charset="utf-8">
 <style>
-  @page {{
-    size: A4;
-    margin: 15mm 18mm;
-  }}
+  {page_rule}
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
     font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -559,7 +559,7 @@ def _build_invoice_html(invoice: Invoice, products: list[Product], invoice_bank_
   .invoice-sheet__terms-item {{
     margin-bottom: 2px;
   }}
-</style>
+{paper_css}</style>
 </head>
 <body>
 <div class="invoice-sheet">
@@ -634,17 +634,17 @@ def _build_invoice_html(invoice: Invoice, products: list[Product], invoice_bank_
     return html
 
 
-def _build_multi_copy_invoice_html(invoice: Invoice, products: list[Product], invoice_bank_accounts: list[CompanyAccount], copies: int, show_sku: bool = True, serials: dict[int, list[str]] | None = None, pay_qr_html: str = "", settlement: dict[str, float] | None = None) -> str:
+def _build_multi_copy_invoice_html(invoice: Invoice, products: list[Product], invoice_bank_accounts: list[CompanyAccount], copies: int, show_sku: bool = True, serials: dict[int, list[str]] | None = None, pay_qr_html: str = "", settlement: dict[str, float] | None = None, paper: str = "a4") -> str:
     """Generate HTML for multiple copies of an invoice in a single document."""
     if invoice.voucher_type == "purchase":
-        return _build_purchase_invoice_html(invoice, products, serials, settlement=settlement)
+        return _build_purchase_invoice_html(invoice, products, serials, settlement=settlement, paper=paper)
     if copies == 1:
-        return _build_invoice_html(invoice, products, invoice_bank_accounts, copy_label=_copy_label(1), show_sku=show_sku, serials=serials, pay_qr_html=pay_qr_html)
+        return _build_invoice_html(invoice, products, invoice_bank_accounts, copy_label=_copy_label(1), show_sku=show_sku, serials=serials, pay_qr_html=pay_qr_html, paper=paper)
 
     pages = []
     first_html: str | None = None
     for i in range(1, copies + 1):
-        full_html = _build_invoice_html(invoice, products, invoice_bank_accounts, copy_label=_copy_label(i), show_sku=show_sku, serials=serials, pay_qr_html=pay_qr_html)
+        full_html = _build_invoice_html(invoice, products, invoice_bank_accounts, copy_label=_copy_label(i), show_sku=show_sku, serials=serials, pay_qr_html=pay_qr_html, paper=paper)
         if i == 1:
             first_html = full_html
         body_open_end = full_html.index('<body>') + len('<body>')

@@ -9098,3 +9098,22 @@ a.ledger-chip:focus-visible {
     display: none;
   }
 }
+
+/* Paper size picker */
+.paper-picker { cursor: default; }
+
+.paper-picker__select {
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.paper-picker--inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}

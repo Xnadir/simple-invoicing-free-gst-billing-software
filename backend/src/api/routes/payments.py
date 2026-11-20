@@ -18,6 +18,7 @@ from src.schemas.payment import PaymentCreate, PaymentOut, PaymentUpdate
 from src.services.series import generate_next_number
 from src.services.financial_year import get_active_fy, get_fy_for_date
 from src.services.invoice_payments import sync_payment_allocations
+from src.services.pdf_paper import Paper, page_css, resolve_paper
 from src.services.pdf_templates.builders import _fmt_inr
 from src.services.share_documents import get_payment as get_shared_payment, render_receipt_pdf
 from src.services.company_access import company_scope
@@ -387,6 +388,19 @@ def delete_payment(
 # Receipt / Payment voucher PDF
 # ---------------------------------------------------------------------------
 
+# The receipt is a short page; on A5 it only needs smaller type and tighter boxes.
+_RECEIPT_A5_CSS = """
+  body { font-size: 9px; }
+  .header { padding-bottom: 8px; margin-bottom: 8px; gap: 8px; }
+  .header h3 { font-size: 13px; }
+  .party-box { padding: 6px 8px; margin-bottom: 8px; }
+  .details-table td { padding: 3px 6px; }
+  .allocations-table th, .allocations-table td { padding: 3px 2px; }
+  .allocations-table tbody td:first-child { white-space: nowrap; }
+  .amount-big { font-size: 20px; }
+"""
+
+
 def _re(text: str | None) -> str:
     return escape(str(text or ""))
 
@@ -414,7 +428,11 @@ def _build_receipt_html(
   payment: Payment,
   company: CompanyProfile | None,
   allocation_status_by_invoice_id: dict[int, str] | None = None,
+  paper: str = "a4",
 ) -> str:
+    """The receipt or payment voucher, for A4 or A5 ``paper``."""
+    page_rule = page_css("a5" if paper == "a5" else "a4", a4_margin="12mm 14mm")
+    paper_css = _RECEIPT_A5_CSS if paper == "a5" else ""
     ledger = payment.ledger
     account = payment.account
 
@@ -546,10 +564,7 @@ def _build_receipt_html(
 <head>
 <meta charset="utf-8">
 <style>
-  @page {{
-    size: A4;
-    margin: 12mm 14mm;
-  }}
+  {page_rule}
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
     font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -733,7 +748,7 @@ def _build_receipt_html(
     color: #6b7280;
     text-align: center;
   }}
-</style>
+{paper_css}</style>
 </head>
 <body>
 <div class="sheet">
@@ -790,6 +805,7 @@ def _build_receipt_html(
 @router.get("/{payment_id}/pdf")
 def download_payment_pdf(
     payment_id: int,
+    paper: Paper | None = Query(None),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
   active_company: CompanyProfile = Depends(get_active_company),
@@ -802,7 +818,7 @@ def download_payment_pdf(
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
 
-    buf = render_receipt_pdf(db, company_id, payment_id)
+    buf = render_receipt_pdf(db, company_id, payment_id, paper=resolve_paper(paper, active_company))
 
     filename = f"receipt_{payment.payment_number or payment_id}.pdf"
     return StreamingResponse(

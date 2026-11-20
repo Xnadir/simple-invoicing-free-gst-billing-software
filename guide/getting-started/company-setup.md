@@ -20,6 +20,7 @@ description: "Set your GSTIN, logo, bank details, invoice terms, e-way bill sett
 
 Options below the form:
 
+- **Default paper size**: A4, A5, Thermal 80mm or Thermal 58mm. It is used for downloads, emailed PDFs and share links. See [Printing on A5 and thermal printers](../settings/printing).
 - **Show SKU column on invoice PDFs**: when off, the item description gets more width.
 - **Show pay-online QR on invoice PDFs**: adds a QR code that opens a page where your customer can pay by UPI. See [Pay by UPI](../sales/sending#pay-by-upi).
 - **Show "Pay by UPI" button on shared invoices**: adds tap-to-pay shortcuts. Turn it on only if your UPI ID is registered as a merchant, because otherwise apps such as Paytm warn your customer. The QR code works either way.

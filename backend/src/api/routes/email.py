@@ -1,8 +1,8 @@
 from datetime import date
 from pathlib import Path
 
-import weasyprint
-from src.services.pdf_render import safe_url_fetcher
+from src.services.pdf_paper import is_thermal, render_pdf, resolve_paper
+from src.services.upi import render_qr_png_data_uri
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel
@@ -159,6 +159,9 @@ async def send_invoice_email(
             db, request, active_company, RESOURCE_INVOICE, invoice_id, user_id=current_user.id
         )
 
+    # The recipient has no picker, so the attachment is on the company's paper.
+    paper = resolve_paper(None, company)
+
     # Emailed and downloaded copies of the same invoice must agree; without this
     # the customer's copy would silently omit the IMEIs the shop's copy prints.
     pdf_buf = _build_invoice_pdf(
@@ -169,6 +172,12 @@ async def send_invoice_email(
         serials=SerialManager(db).serials_for_invoice(invoice),
         pay_qr_html=build_pay_qr_card_html(share_url),
         settlement=purchase_settlement(db, invoice),
+        paper=paper,
+        qr_uri=(
+            render_qr_png_data_uri(share_url)
+            if share_url and is_thermal(paper) and invoice.voucher_type != "purchase"
+            else ""
+        ),
     )
     pdf_bytes = pdf_buf.read()
 
@@ -272,6 +281,8 @@ async def send_ledger_statement_email(
 
     statement_data = _build_ledger_statement_data(db, ledger, payload.from_date, payload.to_date, company_id=company_id)
 
+    # A statement is a report: a thermal company default prints it on A4.
+    statement_paper = resolve_paper(None, company, report=True)
     html_pdf = _build_statement_html(
         ledger=ledger,
         company=company,
@@ -283,8 +294,9 @@ async def send_ledger_statement_email(
         closing_balance=statement_data.closing_balance,
         entries=statement_data.entries,
         currency=currency_code,
+        paper=statement_paper,
     )
-    pdf_bytes: bytes = weasyprint.HTML(string=html_pdf, url_fetcher=safe_url_fetcher).write_pdf() or b""
+    pdf_bytes: bytes = render_pdf(html_pdf, statement_paper) or b""
 
     # Summarise invoice debits and payment credits separately for the email body
     total_invoiced = sum(entry.debit for entry in statement_data.entries if entry.entry_type == "invoice")

@@ -12,8 +12,7 @@ from sqlalchemy import case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-import weasyprint
-from src.services.pdf_render import safe_url_fetcher
+from src.services.pdf_paper import ReportPaper, page_css, render_pdf, resolve_paper
 
 from src.api.deps import get_active_company, get_current_user, require_company_role
 from src.api.pagination import MAX_PAGE
@@ -865,6 +864,7 @@ def get_day_book(
 def download_day_book_pdf(
     from_date: date = Query(...),
     to_date: date = Query(...),
+    paper: ReportPaper | None = Query(None),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
     active_company: CompanyProfile = Depends(get_active_company),
@@ -875,6 +875,7 @@ def download_day_book_pdf(
 
     company = active_company if company_id is not None else legacy_default_company(db)
     currency = company.currency_code if company and company.currency_code else "INR"
+    resolved_paper = resolve_paper(paper, company, report=True)
 
     day_book_data = _build_day_book_data(
       db,
@@ -891,9 +892,10 @@ def download_day_book_pdf(
       total_debit=day_book_data.total_debit,
       total_credit=day_book_data.total_credit,
       currency=currency,
+      paper=resolved_paper,
     )
 
-    pdf_bytes = weasyprint.HTML(string=html, url_fetcher=safe_url_fetcher).write_pdf()
+    pdf_bytes = render_pdf(html, resolved_paper)
     buf = BytesIO(pdf_bytes)
     filename = f"day_book_{from_date}_{to_date}.pdf"
 
@@ -1391,6 +1393,7 @@ def download_ledger_statement_pdf(
     ledger_id: int,
     from_date: date = Query(...),
     to_date: date = Query(...),
+    paper: ReportPaper | None = Query(None),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
     active_company: CompanyProfile = Depends(get_active_company),
@@ -1406,7 +1409,10 @@ def download_ledger_statement_pdf(
     if not ledger:
         raise HTTPException(status_code=404, detail=f"Ledger {ledger_id} not found")
 
-    buf = render_statement_pdf(db, company_id, ledger_id, from_date, to_date)
+    buf = render_statement_pdf(
+        db, company_id, ledger_id, from_date, to_date,
+        paper=resolve_paper(paper, active_company, report=True),
+    )
     filename = _statement_filename(ledger, from_date, to_date, "pdf")
 
     return StreamingResponse(
@@ -1667,6 +1673,7 @@ def download_tax_ledger_pdf(
     to_date: date = Query(...),
     voucher_type: str | None = Query(None, pattern="^(sales|purchase)$"),
     gst_rate: float | None = Query(None, ge=0, allow_inf_nan=False),
+    paper: ReportPaper | None = Query(None),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
     active_company: CompanyProfile = Depends(get_active_company),
@@ -1677,6 +1684,7 @@ def download_tax_ledger_pdf(
 
     company = active_company if company_id is not None else legacy_default_company(db)
     currency = company.currency_code if company and company.currency_code else "INR"
+    resolved_paper = resolve_paper(paper, company, report=True)
     result = _build_full_tax_ledger(db, from_date, to_date, voucher_type, gst_rate, company_id)
     totals = _build_tax_ledger_totals(result.entries)
 
@@ -1688,9 +1696,10 @@ def download_tax_ledger_pdf(
         totals=totals,
         liability=result.liability,
         currency=currency,
+        paper=resolved_paper,
     )
 
-    pdf_bytes = weasyprint.HTML(string=html, url_fetcher=safe_url_fetcher).write_pdf()
+    pdf_bytes = render_pdf(html, resolved_paper)
     buf = BytesIO(pdf_bytes)
     filename = f"tax_ledger_{from_date}_{to_date}.pdf"
 
@@ -1856,6 +1865,24 @@ def _build_full_tax_ledger(
     )
 
 
+# A5 overrides for the plain report PDFs (tax ledger, GSTR-1). They follow the
+# template's own styles; A4 output is unchanged.
+_A5_PLAIN_REPORT_CSS = """
+    body { margin: 0; }
+    h1 { font-size: 14px; }
+    th, td { padding: 3px 2px; font-size: 7px; }
+    td { white-space: nowrap; }
+"""
+# The party name wraps; the nine columns do not fit on A5 otherwise.
+_A5_TAX_LEDGER_CSS = """
+    .party { white-space: normal; }
+"""
+_A5_GSTR1_CSS = """
+    h2 { font-size: 11px; }
+    td.category { white-space: normal; }
+"""
+
+
 def _build_tax_ledger_pdf_html(
     *,
     company,
@@ -1865,6 +1892,7 @@ def _build_tax_ledger_pdf_html(
     totals: TaxLedgerTotals,
     liability: TaxLiability,
     currency: str,
+    paper: ReportPaper = "a4",
 ) -> str:
     rows_html = ""
     for entry in entries:
@@ -1875,7 +1903,7 @@ def _build_tax_ledger_pdf_html(
         <tr>
             <td>{entry.date.date().isoformat()}</td>
             <td>{_e(entry.reference_number)}</td>
-            <td>{_e(entry.ledger_name)}</td>
+            <td class="party">{_e(entry.ledger_name)}</td>
             <td>{_e(entry.ledger_gst or '')}</td>
             <td>{entry.gst_rate:.0f}%</td>
             <td style="text-align:right">₹{entry.taxable_amount:,.2f}</td>
@@ -1884,9 +1912,12 @@ def _build_tax_ledger_pdf_html(
             <td style="text-align:right">₹{igst:,.2f}</td>
         </tr>"""
 
+    a5_style = f"<style>{_A5_PLAIN_REPORT_CSS}{_A5_TAX_LEDGER_CSS}</style>" if paper == "a5" else ""
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
+    {page_css(paper) if paper == "a5" else ""}
     body {{ font-family: Arial, sans-serif; font-size: 11px; margin: 24px; }}
     h1 {{ font-size: 18px; margin-bottom: 4px; }}
     .meta {{ color: #555; margin-bottom: 16px; }}
@@ -1895,7 +1926,8 @@ def _build_tax_ledger_pdf_html(
     th {{ background: #f5f5f5; text-align: left; }}
     .totals {{ margin-top: 16px; }}
     .totals table {{ width: 60%; }}
-</style></head><body>
+</style>
+{a5_style}</head><body>
 <h1>Tax Ledger</h1>
 <p class="meta">
     {_e(company.name if company else '')} &mdash;
@@ -3221,6 +3253,7 @@ def gstr1_export_csv(
 def gstr1_export_pdf(
     from_date: date = Query(...),
     to_date: date = Query(...),
+    paper: ReportPaper | None = Query(None),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
     active_company: CompanyProfile = Depends(get_active_company),
@@ -3233,6 +3266,7 @@ def gstr1_export_pdf(
     # Reuse summary logic inline
     company = active_company if company_id is not None else legacy_default_company(db)
     currency = company.currency_code if company and company.currency_code else "INR"
+    resolved_paper = resolve_paper(paper, company, report=True)
 
     invoices = _gstr1_invoice_query(db, from_date, to_date, company_id)
     company_pos = _derive_place_of_supply(company.gst if company else None)
@@ -3248,9 +3282,11 @@ def gstr1_export_pdf(
     nil_rated_count = len(b2cs_all) - len(b2cs_invoices)
     credit_notes = _gstr1_credit_notes(db, from_date, to_date, company_id)
 
+    a5_style = f"<style>{_A5_PLAIN_REPORT_CSS}{_A5_GSTR1_CSS}</style>" if resolved_paper == "a5" else ""
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
+    {page_css(resolved_paper) if resolved_paper == "a5" else ""}
     body {{ font-family: Arial, sans-serif; font-size: 11px; margin: 24px; }}
     h1 {{ font-size: 18px; margin-bottom: 4px; }}
     h2 {{ font-size: 14px; margin-top: 20px; }}
@@ -3259,7 +3295,8 @@ def gstr1_export_pdf(
     th, td {{ border: 1px solid #ccc; padding: 5px 8px; font-size: 10px; }}
     th {{ background: #f5f5f5; text-align: left; }}
     .right {{ text-align: right; }}
-</style></head><body>
+</style>
+{a5_style}</head><body>
 <h1>GSTR-1 Filing Report</h1>
 <p class="meta">
     {_e(company.name if company else '')} &mdash;
@@ -3272,25 +3309,25 @@ def gstr1_export_pdf(
         <th>CGST</th><th>SGST</th><th>IGST</th><th>Total Tax</th>
     </tr></thead>
     <tbody>
-        <tr><td>B2B (with GSTIN)</td><td>{len(b2b_invoices)}</td>
+        <tr><td class="category">B2B (with GSTIN)</td><td>{len(b2b_invoices)}</td>
             <td class="right">₹{sum(float(inv.taxable_amount or 0) for inv in b2b_invoices):,.2f}</td>
             <td class="right">₹{sum(float(inv.cgst_amount or 0) for inv in b2b_invoices):,.2f}</td>
             <td class="right">₹{sum(float(inv.sgst_amount or 0) for inv in b2b_invoices):,.2f}</td>
             <td class="right">₹{sum(float(inv.igst_amount or 0) for inv in b2b_invoices):,.2f}</td>
             <td class="right">₹{sum(_invoice_tax(inv) for inv in b2b_invoices):,.2f}</td>
         </tr>
-        <tr><td>B2CL (large interstate, no GSTIN)</td><td>{len(b2cl_invoices)}</td>
+        <tr><td class="category">B2CL (large interstate, no GSTIN)</td><td>{len(b2cl_invoices)}</td>
             <td class="right">₹{sum(float(inv.taxable_amount or 0) for inv in b2cl_invoices):,.2f}</td>
             <td colspan="4" class="right">-</td>
         </tr>
-        <tr><td>B2CS (other sales, no GSTIN, before credit notes)</td><td>{len(b2cs_invoices)}</td>
+        <tr><td class="category">B2CS (other sales, no GSTIN, before credit notes)</td><td>{len(b2cs_invoices)}</td>
             <td class="right">₹{sum(float(inv.taxable_amount or 0) for inv in b2cs_invoices):,.2f}</td>
             <td colspan="4" class="right">-</td>
         </tr>
-        <tr><td>B2C sales with no tax (filed in B2CS at rate 0)</td><td>{nil_rated_count}</td>
+        <tr><td class="category">B2C sales with no tax (filed in B2CS at rate 0)</td><td>{nil_rated_count}</td>
             <td colspan="5" class="right">-</td>
         </tr>
-        <tr><td>Credit notes</td><td>{len(credit_notes)}</td>
+        <tr><td class="category">Credit notes</td><td>{len(credit_notes)}</td>
             <td class="right">₹{sum(float(cn.taxable_amount or 0) for cn in credit_notes):,.2f}</td>
             <td colspan="4" class="right">-</td>
         </tr>
@@ -3299,7 +3336,7 @@ def gstr1_export_pdf(
 <p style="font-size: 9px; color: #888;">Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
 </body></html>"""
 
-    pdf_bytes = weasyprint.HTML(string=html, url_fetcher=safe_url_fetcher).write_pdf()
+    pdf_bytes = render_pdf(html, resolved_paper)
     buf = BytesIO(pdf_bytes)
     filename = f"gstr1_{from_date}_{to_date}.pdf"
 

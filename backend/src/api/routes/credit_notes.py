@@ -16,6 +16,7 @@ from src.models.credit_note import CreditNote, CreditNoteInvoiceRef
 from src.models.user import User
 from src.schemas.credit_note import CreditNoteCreate, CreditNoteOut, PaginatedCreditNoteOut
 from src.services.credit_note import cancel_credit_note, create_credit_note
+from src.services.pdf_paper import Paper, resolve_paper
 from src.services.share_documents import credit_note_document_label, render_credit_note_pdf
 from src.services.company_access import company_scope
 
@@ -163,6 +164,7 @@ def get_credit_note(
 @router.get("/{cn_id}/pdf")
 def download_credit_note_pdf(
     cn_id: int,
+    paper: Paper | None = Query(None),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
     active_company: CompanyProfile = Depends(get_active_company),
@@ -180,7 +182,7 @@ def download_credit_note_pdf(
     if not cn:
         raise HTTPException(status_code=404, detail="Credit note not found")
 
-    buf = render_credit_note_pdf(db, company_id, cn_id)
+    buf = render_credit_note_pdf(db, company_id, cn_id, paper=resolve_paper(paper, active_company))
 
     prefix = credit_note_document_label(cn).lower().replace(" ", "_")
     filename = f"{prefix}_{cn.credit_note_number.replace('/', '_')}.pdf"
