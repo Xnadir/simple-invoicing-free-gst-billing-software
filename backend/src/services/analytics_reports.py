@@ -18,6 +18,7 @@ from operator import attrgetter
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.models.buyer import Buyer
 from src.models.credit_note import CreditNote, CreditNoteItem
 from src.models.inventory import Inventory
 from src.models.invoice import Invoice, InvoiceItem
@@ -133,6 +134,10 @@ def build_monthly_sales_report(
 
     Every month in the range is emitted, including empty ones — a chart with
     gaps silently omitted would misrepresent a quiet month as no month.
+
+    Active credit notes reduce taxable value, GST and total sales in the
+    month of the *credit note* date, same direction rule as Product
+    Performance (outward for sales, inward for purchase).
     """
     invoices = _scoped_invoice_query(
         db,
@@ -160,6 +165,27 @@ def build_monthly_sales_report(
         bucket.taxable_value += Decimal(str(invoice.taxable_amount or 0))
         bucket.gst_collected += Decimal(str(invoice.total_tax_amount or 0))
         bucket.discount_given += discounts[invoice.id].total_discount
+
+    # Active credit notes on sales dated in the range reduce the month they
+    # were issued in, not the month of the invoice they reverse — the same
+    # split the day book uses. Every note type (return, discount, adjustment)
+    # reduces value here: there is no per-unit figure in this report for the
+    # return/other distinction to matter.
+    expected_direction = _note_direction_for(voucher_type)
+    for note in _credit_note_lines(
+        db, company_id=company_id, from_date=from_date, to_date=to_date,
+        ledger_id=ledger_id, product_id=None,
+    ):
+        if (note.direction or "outward") != expected_direction:
+            continue
+        bucket = buckets.get((note.credit_note_date.year, note.credit_note_date.month))
+        if bucket is None:
+            continue
+        taxable_value = Decimal(str(note.taxable_amount or 0))
+        tax_value = Decimal(str(note.tax_amount or 0))
+        bucket.taxable_value -= taxable_value
+        bucket.gst_collected -= tax_value
+        bucket.total_sales -= taxable_value + tax_value
 
     totals = MonthlyBucket()
     for bucket in buckets.values():
@@ -193,7 +219,12 @@ def build_product_sales_report(
     sort_dir: str = "desc",
     limit: int | None = None,
 ) -> ProductSalesData:
-    """Aggregate invoice lines into one row per product."""
+    """Aggregate invoice lines into one row per product.
+
+    Active credit notes reduce ``quantity_sold`` (return notes only) and
+    revenue (every note type, both ex- and incl-GST), the same rule Product
+    Performance uses, so the two reports agree.
+    """
     start, end = _date_bounds(from_date, to_date)
 
     query = (
@@ -270,19 +301,51 @@ def build_product_sales_report(
         product_id=product_id,
     )
 
+    # Active credit notes reduce quantity (return notes only) and revenue
+    # (every note type), the same rule Product Performance uses. Averages are
+    # still taken over the gross, pre-note figures (see that report's
+    # docstring), so only the net fields below are adjusted.
+    expected_direction = _note_direction_for(voucher_type)
+    note_qty: dict[int, Decimal] = {}
+    note_taxable: dict[int, Decimal] = {}
+    note_tax: dict[int, Decimal] = {}
+    for note in _credit_note_lines(
+        db, company_id=company_id, from_date=from_date, to_date=to_date,
+        ledger_id=ledger_id, product_id=product_id,
+    ):
+        if (note.direction or "outward") != expected_direction:
+            continue
+        pid = note.product_id
+        note_taxable[pid] = note_taxable.get(pid, Decimal("0")) + Decimal(str(note.taxable_amount or 0))
+        note_tax[pid] = note_tax.get(pid, Decimal("0")) + Decimal(str(note.tax_amount or 0))
+        if note.credit_note_type == "return":
+            note_qty[pid] = note_qty.get(pid, Decimal("0")) + Decimal(str(note.quantity or 0))
+
     rows: list[dict] = []
     for pid, name, sku, maintain_inventory, quantity, taxable, tax, revenue, invoice_count in grouped:
-        qty = Decimal(str(quantity or 0))
-        sales_amount = discounted_sales.get(pid, Decimal(str(taxable or 0)))
+        gross_qty = Decimal(str(quantity or 0))
+        gross_sales_amount = discounted_sales.get(pid, Decimal(str(taxable or 0)))
+        gross_total_revenue = discounted_revenue.get(pid, Decimal(str(revenue or 0)))
+        gross_total_gst = Decimal(str(tax or 0))
+
+        returned_qty = note_qty.get(pid, Decimal("0"))
+        notes_taxable = note_taxable.get(pid, Decimal("0"))
+        notes_tax = note_tax.get(pid, Decimal("0"))
+
+        qty = gross_qty - returned_qty
+        sales_amount = gross_sales_amount - notes_taxable
+        total_gst = gross_total_gst - notes_tax
+        total_revenue = gross_total_revenue - notes_taxable - notes_tax
+
         rows.append({
             "product_id": pid,
             "name": name,
             "sku": sku,
             "quantity_sold": qty,
             "sales_amount": sales_amount,
-            "average_selling_price": average_of(sales_amount, qty),
-            "total_revenue": discounted_revenue.get(pid, Decimal(str(revenue or 0))),
-            "total_gst": Decimal(str(tax or 0)),
+            "average_selling_price": average_of(gross_sales_amount, gross_qty),
+            "total_revenue": total_revenue,
+            "total_gst": total_gst,
             "invoice_count": int(invoice_count or 0),
             "current_stock": stock_map.get(pid, Decimal("0")) if maintain_inventory else None,
         })
@@ -451,6 +514,11 @@ def build_profit_loss_report(
     lines the same way Product Performance does; GST is pass-through and never
     counted as profit.
 
+    Active credit notes dated in the range then reduce quantity, revenue and
+    COGS the same way: every note type lowers revenue, but only a ``return``
+    note lowers quantity and COGS, since a discount or adjustment note sends
+    no goods back.
+
     All three breakdowns come from one line-level scan so the numbers can't
     diverge. When ``product_id`` is set, ``monthly_rows`` narrows to that
     product's series — the per-product purchase-vs-sales view reuses it directly.
@@ -561,6 +629,80 @@ def build_profit_loss_report(
         customer["invoice_ids"].add(invoice_id)
 
         total_invoice_ids.add(invoice_id)
+
+    # Active credit notes dated in the range reduce product, month and
+    # customer figures the same way Product Performance does: revenue falls
+    # for every note type, while quantity (and, via the quantity_sold x
+    # purchase_price formula below, COGS) falls only for return notes, since a
+    # discount or adjustment note sends no goods back. Notes are booked in the
+    # month of the *credit note* date, not the invoice's.
+    expected_direction = _note_direction_for(voucher_type)
+    note_lines = [
+        note
+        for note in _credit_note_lines(
+            db, company_id=company_id, from_date=from_date, to_date=to_date,
+            ledger_id=ledger_id, product_id=product_id,
+        )
+        if (note.direction or "outward") == expected_direction
+    ]
+
+    if note_lines:
+        # A note's product or customer might never have appeared above — e.g.
+        # the invoice falls outside this narrower window while the note
+        # doesn't — so make sure both have an accumulator to subtract into.
+        missing_pids = {note.product_id for note in note_lines} - products.keys()
+        if missing_pids:
+            for extra in (
+                db.query(Product.id, Product.name, Product.sku, Product.purchase_price)
+                .filter(Product.id.in_(missing_pids))
+                .all()
+            ):
+                products[extra.id] = {
+                    "product_id": extra.id,
+                    "name": extra.name,
+                    "sku": extra.sku,
+                    "purchase_price": Decimal(str(extra.purchase_price or 0)),
+                    "quantity_sold": Decimal("0"),
+                    "revenue": Decimal("0"),
+                }
+
+        missing_ledger_ids = {note.ledger_id for note in note_lines} - customers.keys()
+        ledger_names: dict[int, str] = {}
+        if missing_ledger_ids:
+            ledger_names = dict(
+                db.query(Buyer.id, Buyer.name).filter(Buyer.id.in_(missing_ledger_ids)).all()
+            )
+
+        for note in note_lines:
+            units = Decimal(str(note.quantity or 0)) if note.credit_note_type == "return" else Decimal("0")
+            value = Decimal(str(note.taxable_amount or 0))
+
+            product = products.get(note.product_id)
+            cost = product["purchase_price"] if product is not None else Decimal("0")
+            line_cogs = units * cost
+
+            if product is not None:
+                product["quantity_sold"] -= units
+                product["revenue"] -= value
+
+            bucket = months.get((note.credit_note_date.year, note.credit_note_date.month))
+            if bucket is not None:  # defensive: the query is already range-bounded
+                bucket["quantity"] -= units
+                bucket["revenue"] -= value
+                bucket["cogs"] -= line_cogs
+
+            customer = customers.get(note.ledger_id)
+            if customer is None:
+                customer = {
+                    "ledger_id": note.ledger_id,
+                    "name": ledger_names.get(note.ledger_id, "—"),
+                    "revenue": Decimal("0"),
+                    "cogs": Decimal("0"),
+                    "invoice_ids": set(),
+                }
+                customers[note.ledger_id] = customer
+            customer["revenue"] -= value
+            customer["cogs"] -= line_cogs
 
     product_rows: list[dict] = []
     for product in products.values():
@@ -771,15 +913,21 @@ def _credit_note_lines(
     Strict company equality on the note header: unlike
     :mod:`src.services.credit_note_reporting`, a NULL-company note must not
     leak into every company's figures on a reporting surface.
+
+    Rows carry ``tax_amount`` and ``ledger_id`` alongside the fields Product
+    Performance uses, so the other report builders can reduce GST-inclusive
+    totals and per-customer figures with the same query.
     """
     start, end = _date_bounds(from_date, to_date)
     query = (
         db.query(
             CreditNote.direction,
             CreditNote.credit_note_type,
+            CreditNote.ledger_id,
             CreditNoteItem.product_id,
             CreditNoteItem.quantity,
             CreditNoteItem.taxable_amount,
+            CreditNoteItem.tax_amount,
             CreditNote.credit_note_date,
         )
         .join(CreditNote, CreditNoteItem.credit_note_id == CreditNote.id)
@@ -796,6 +944,16 @@ def _credit_note_lines(
     if product_id is not None:
         query = query.filter(CreditNoteItem.product_id == product_id)
     return query.all()
+
+
+def _note_direction_for(voucher_type: str) -> str:
+    """Which credit-note direction counts against a report's voucher type.
+
+    An outward note was issued against a sales invoice; an inward note is a
+    supplier's note against a purchase. A NULL direction predates the column
+    and was always outward (see :func:`_add_note_line`).
+    """
+    return "outward" if voucher_type == "sales" else "inward"
 
 
 def _purchase_unit_costs(lines: list[tuple[int, Decimal, Decimal]]) -> dict[int, Decimal]:
@@ -816,6 +974,7 @@ def _purchase_unit_costs(lines: list[tuple[int, Decimal, Decimal]]) -> dict[int,
 _PERFORMANCE_FIELDS = (
     "units_sold", "units_returned", "units_bought", "units_purchase_returned",
     "sales_value", "return_value", "purchase_value", "purchase_return_value",
+    "return_tax", "purchase_return_tax",
 )
 
 
@@ -823,20 +982,25 @@ def _empty_performance_bucket() -> dict[str, Decimal]:
     return {field: Decimal("0") for field in _PERFORMANCE_FIELDS}
 
 
-def _add_note_line(entry: dict[str, Decimal], direction, note_type, qty, taxable) -> None:
+def _add_note_line(entry: dict[str, Decimal], direction, note_type, qty, taxable, tax=Decimal("0")) -> None:
     """Fold one credit/debit note line into a bucket.
 
-    Every note type reduces value; only ``return`` notes move units.
+    Every note type reduces value; only ``return`` notes move units. ``tax``
+    is optional — Product Performance never needs it, but the GST-inclusive
+    reports (Sales by Month, Sales by Product) do.
     """
     units = Decimal(str(qty or 0)) if note_type == "return" else Decimal("0")
     value = Decimal(str(taxable or 0))
+    tax_value = Decimal(str(tax or 0))
     # A NULL direction predates the column; every such note was outward.
     if direction == "inward":
         entry["units_purchase_returned"] += units
         entry["purchase_return_value"] += value
+        entry["purchase_return_tax"] += tax_value
     else:
         entry["units_returned"] += units
         entry["return_value"] += value
+        entry["return_tax"] += tax_value
 
 
 def _unit_cost(period_cost: Decimal | None, purchase_price) -> tuple[Decimal | None, str | None]:
@@ -973,8 +1137,11 @@ def build_product_performance_report(
         entry = bucket(pid)
         entry["units_bought"] += qty
         entry["purchase_value"] += taxable
-    for direction, note_type, pid, qty, taxable, _note_date in note_lines:
-        _add_note_line(bucket(pid), direction, note_type, qty, taxable)
+    for note in note_lines:
+        _add_note_line(
+            bucket(note.product_id), note.direction, note.credit_note_type,
+            note.quantity, note.taxable_amount, note.tax_amount,
+        )
 
     if not acc:
         return ProductPerformanceData(rows=[], totals=_performance_totals([]))
@@ -1148,8 +1315,11 @@ def build_product_performance_detail(
     for _, qty, taxable, when in cost_lines:
         paid[(when.year, when.month)][0] += taxable
         paid[(when.year, when.month)][1] += qty
-    for direction, note_type, _, qty, taxable, note_date in note_lines:
-        _add_note_line(buckets[(note_date.year, note_date.month)], direction, note_type, qty, taxable)
+    for note in note_lines:
+        _add_note_line(
+            buckets[(note.credit_note_date.year, note.credit_note_date.month)],
+            note.direction, note.credit_note_type, note.quantity, note.taxable_amount, note.tax_amount,
+        )
 
     # COGS is booked as the change in the rounded running total rather than
     # rounded month by month: per-month rounding of units x an unrounded cost
