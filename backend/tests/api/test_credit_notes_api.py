@@ -630,7 +630,7 @@ _ROUNDED_LINES = [
 
 
 @pytest.mark.parametrize("place_of_supply", [None, "27"], ids=["intrastate", "interstate"])
-@pytest.mark.parametrize("discount_value", ["7.5", "3.3"], ids=["rounds-down", "rounds-up"])
+@pytest.mark.parametrize("discount_value", ["7.5", "3.2"], ids=["rounds-down", "rounds-up"])
 def test_full_return_of_a_discounted_rounded_multi_line_invoice_closes_the_account(
     client, gst_seller, place_of_supply, discount_value,
 ):
@@ -644,7 +644,7 @@ def test_full_return_of_a_discounted_rounded_multi_line_invoice_closes_the_accou
         discount_type="percentage", discount_value=discount_value, apply_round_off=True,
     )
     assert invoice["round_off_amount"] != 0
-    assert (invoice["round_off_amount"] > 0) == (discount_value == "3.3")
+    assert (invoice["round_off_amount"] > 0) == (discount_value == "3.2")
 
     response = _note(client, invoice, items=[
         {"invoice_id": invoice["id"], "invoice_item_id": item["id"], "quantity": item["quantity"]}
