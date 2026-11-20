@@ -489,6 +489,50 @@ def sync_payment_allocations(
         ))
 
 
+def invoice_has_active_payment_allocations(db: Session, invoice_id: int) -> bool:
+    """Whether an active receipt or payment has an allocation against this invoice.
+
+    Used by the invoice edit route to refuse a ledger or voucher-type change
+    that would leave an allocation pointing at the wrong party or the wrong
+    side of the books — the same state ``_validate_payment_allocations_detailed``
+    already refuses from the payment side.
+    """
+    return (
+        db.query(PaymentInvoiceAllocation.id)
+        .join(Payment, Payment.id == PaymentInvoiceAllocation.payment_id)
+        .filter(
+            Payment.status == "active",
+            PaymentInvoiceAllocation.invoice_id == invoice_id,
+        )
+        .first()
+        is not None
+    )
+
+
+def payment_allocated_total(db: Session, invoice_id: int) -> Decimal:
+    """Cash plus TDS actively allocated to *invoice_id* from receipts/payments.
+
+    Mirrors the ``paid_amount`` + ``tds_amount`` figures
+    :func:`build_invoice_payment_summaries` computes, for a single invoice and
+    with no need to build full summaries. Used to refuse an invoice edit that
+    would shrink the total below what is already allocated against it.
+    """
+    row = (
+        db.query(
+            func.coalesce(func.sum(PaymentInvoiceAllocation.allocated_amount), 0),
+            func.coalesce(func.sum(PaymentInvoiceAllocation.tds_amount), 0),
+        )
+        .join(Payment, Payment.id == PaymentInvoiceAllocation.payment_id)
+        .filter(
+            Payment.status == "active",
+            PaymentInvoiceAllocation.invoice_id == invoice_id,
+        )
+        .first()
+    )
+    cash, tds = row if row else (0, 0)
+    return _money(Decimal(str(cash or 0)) + Decimal(str(tds or 0)))
+
+
 def invoice_has_tds_allocated(db: Session, invoice_id: int) -> bool:
     """True when an active receipt/payment has TDS settled against this invoice (#768, #770)."""
     return (

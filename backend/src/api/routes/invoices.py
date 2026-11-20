@@ -38,6 +38,7 @@ from src.services.financial_year import get_active_fy, get_fy_for_date
 from src.services.gst_tax_service import india_today
 from src.services.invoice_payments import (
     build_invoice_payment_summaries,
+    invoice_has_active_payment_allocations,
     invoice_has_tds_allocated,
     outstanding_due_invoices as _outstanding_due_invoices,
 )
@@ -723,6 +724,27 @@ def update_invoice(
                 detail=(
                     "Cannot edit an invoice that has credit notes against it "
                     "— cancel them first"
+                ),
+            )
+
+        # A receipt or payment settles against this invoice's current ledger.
+        # Moving the invoice to a different party would leave the allocation
+        # pointing at the wrong customer/supplier with nothing to notice —
+        # the same state validate_payment_allocations already refuses from
+        # the payment side (#786).
+        if payload.ledger_id != invoice.ledger_id and invoice_has_active_payment_allocations(
+            db, invoice.id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This invoice has receipts allocated to it. Remove them from "
+                    "the receipt first."
+                    if invoice.voucher_type == "sales"
+                    else (
+                        "This invoice has payments allocated to it. Remove them "
+                        "from the payment first."
+                    )
                 ),
             )
 
