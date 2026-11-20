@@ -31,6 +31,7 @@ from src.services.gst_tax_service import (
     invoice_is_interstate,
     money as _money,
 )
+from src.services.invoice_payments import payment_allocated_total
 from src.services.tcs import buyer_pan, resolve_tcs
 from src.services.inventory_service import InventoryManager
 from src.services.serial_service import SerialManager
@@ -639,6 +640,22 @@ class InvoiceProcessor:
             Decimal(str(invoice.tcs_amount or 0)),
             Decimal(str(payload.discount_value)) if payload.discount_value is not None else Decimal("0"),
         )
+
+        # An edit that shrinks the total below what active receipts/payments
+        # already settled would leave more allocated than the invoice is
+        # worth — the same state validate_payment_allocations already
+        # refuses from the payment side (#786). A brand-new invoice has no
+        # allocations yet, so this is a no-op on create.
+        allocated = payment_allocated_total(self.db, invoice.id)
+        if allocated > 0 and Decimal(str(invoice.total_amount or 0)) < allocated:
+            term = "receipts" if invoice.voucher_type == "sales" else "payments"
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"This invoice has {float(allocated):.2f} allocated from {term}. "
+                    f"The total cannot be less than that."
+                ),
+            )
 
     # ------------------------------------------------------------------
     # Shipping address helpers
