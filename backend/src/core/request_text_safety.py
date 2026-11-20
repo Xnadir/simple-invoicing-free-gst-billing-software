@@ -11,7 +11,8 @@ or filters. One check in a single place, wired in once as a global dependency
 (see ``app_main.py``), covers all of them instead.
 """
 
-import json
+import email.message
+from urllib.parse import parse_qsl
 
 from fastapi import HTTPException, Request
 
@@ -29,32 +30,78 @@ def _contains_nul(value: object) -> bool:
     return False
 
 
+def _refuse(detail: str) -> HTTPException:
+    return HTTPException(status_code=422, detail=detail)
+
+
+def _is_json_body(content_type: str | None) -> bool:
+    """Mirror FastAPI 0.115's rule for when it JSON-decodes a request body.
+
+    A missing content-type, ``application/json`` and any ``application/*+json``
+    are all decoded as JSON by FastAPI, so all of them must be scanned.
+    """
+    if not content_type:
+        return True
+    message = email.message.Message()
+    message["content-type"] = content_type
+    if message.get_content_maintype() != "application":
+        return False
+    subtype = message.get_content_subtype()
+    return subtype == "json" or subtype.endswith("+json")
+
+
 async def reject_nul_characters(request: Request) -> None:
-    """Refuse any query parameter or JSON body that contains a NUL character.
+    """Refuse a NUL character in query params, path params, a JSON body or a
+    form-encoded body, with a 422.
 
-    Starlette URL-decodes query parameters before we ever see them, so a
-    search of ``?search=%00`` already reads as the character ``\\0`` here.
-    A JSON body carries it differently: a client serializing an embedded NUL
-    writes the escape sequence ``\\u0000`` into the request bytes, never a raw
-    0x00 byte, so a byte-level check on the body would miss it. Decoding the
-    JSON first and checking the resulting strings catches both.
+    Covered: query string, path parameters, JSON bodies (FastAPI's own
+    content-type rule) and ``application/x-www-form-urlencoded`` bodies.
 
-    Multipart uploads (the product CSV import) are not JSON and are skipped
-    here on purpose -- that endpoint reads the file itself and checks each row,
-    so one bad cell fails that row instead of the whole request.
+    Not covered, on purpose: multipart uploads. The backup restore/preflight
+    files are binary and must never be scanned; its one text field
+    (``confirm_text``) is only compared to the word RESTORE and never reaches
+    the database. The product CSV import checks each row itself.
+
+    Starlette URL-decodes query and path parameters before we see them, so
+    ``%00`` already reads as ``\\0``. A JSON body carries an embedded NUL as
+    the escape ``\\u0000``, never a raw 0x00 byte, so the body is decoded
+    first. ``request.json()`` caches its result on the request, so FastAPI's
+    own body parsing later reuses it and the body is parsed only once.
+
+    This runs before authentication, so an unauthenticated request carrying a
+    NUL gets 422 rather than 401. That leaks nothing (the message is generic and
+    names only a parameter the caller sent), and moving it after
+    auth is invasive: auth is a per-route dependency and several routes are
+    public (login, OAuth, public share pages) and need the check too.
     """
     for key, value in request.query_params.multi_items():
         if NUL in key or NUL in value:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"Query parameter {key!r} contains a character that is not "
-                    "allowed: NUL (\\u0000)."
-                ),
+            raise _refuse(
+                f"Query parameter {key!r} contains a character that is not "
+                "allowed: NUL (\\u0000)."
             )
 
-    content_type = request.headers.get("content-type", "")
-    if content_type.split(";", 1)[0].strip().lower() != "application/json":
+    for key, value in request.path_params.items():
+        if _contains_nul(key) or _contains_nul(value):
+            raise _refuse(
+                f"Path parameter {key!r} contains a character that is not "
+                "allowed: NUL (\\u0000)."
+            )
+
+    content_type = request.headers.get("content-type")
+    media_type = (content_type or "").split(";", 1)[0].strip().lower()
+
+    if media_type == "application/x-www-form-urlencoded":
+        body = await request.body()
+        try:
+            pairs = parse_qsl(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+        except ValueError:
+            return
+        if _contains_nul([item for pair in pairs for item in pair]):
+            raise _refuse("This request contains a character that is not allowed: NUL (\\u0000).")
+        return
+
+    if not _is_json_body(content_type):
         return
 
     body = await request.body()
@@ -62,13 +109,10 @@ async def reject_nul_characters(request: Request) -> None:
         return
 
     try:
-        parsed = json.loads(body)
-    except ValueError:
-        # Malformed JSON: let FastAPI's own body parsing raise the usual 422.
+        parsed = await request.json()
+    except (ValueError, RecursionError):
+        # Malformed or absurdly nested JSON: let FastAPI respond as it would.
         return
 
     if _contains_nul(parsed):
-        raise HTTPException(
-            status_code=422,
-            detail="This request contains a character that is not allowed: NUL (\\u0000).",
-        )
+        raise _refuse("This request contains a character that is not allowed: NUL (\\u0000).")
