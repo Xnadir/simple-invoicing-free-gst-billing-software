@@ -3,6 +3,7 @@ from datetime import date, datetime
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -965,6 +966,124 @@ def test_update_payment_without_date_still_works(client, db_session, payment_in_
     assert response.status_code == 200, response.text
     assert response.json()["amount"] == 250
     assert response.json()["financial_year_id"] == 1
+
+
+# ── Cancelling an invoice a receipt is allocated to (#792) ──────────────────
+
+
+def _invoice_with_full_receipt(client, ledger_id):
+    """A ₹236 sales invoice, fully paid by a single receipt allocated to it."""
+    product = client.post(
+        "/api/products/",
+        json={
+            "sku": f"SKU-{uuid4().hex[:8]}",
+            "name": "Widget",
+            "price": 236,
+            "gst_rate": 0,
+            "initial_quantity": 5,
+        },
+    )
+    assert product.status_code == 200, product.text
+    invoice = client.post(
+        "/api/invoices/",
+        json={
+            "ledger_id": ledger_id,
+            "voucher_type": "sales",
+            "tax_inclusive": False,
+            "apply_round_off": False,
+            "items": [
+                {"product_id": product.json()["id"], "quantity": 1, "unit_price": 236}
+            ],
+        },
+    )
+    assert invoice.status_code == 200, invoice.text
+    invoice = invoice.json()
+
+    receipt = client.post(
+        "/api/payments/",
+        json={
+            "ledger_id": ledger_id,
+            "voucher_type": "receipt",
+            "amount": 236,
+            "mode": "cash",
+            "invoice_allocations": [
+                {"invoice_id": invoice["id"], "allocated_amount": 236}
+            ],
+        },
+    )
+    assert receipt.status_code == 200, receipt.text
+    return invoice, receipt.json()
+
+
+def test_cancelling_invoice_with_allocated_receipt_is_refused(client):
+    ledger_id = _payment_ledger(client, "Cancel Guard Ledger")
+    invoice, receipt = _invoice_with_full_receipt(client, ledger_id)
+
+    response = client.delete(f"/api/invoices/{invoice['id']}")
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == f"Remove this invoice from receipt {receipt['payment_number']} first"
+
+    # The invoice is still active and the allocation untouched.
+    invoice_after = client.get(f"/api/invoices/{invoice['id']}")
+    assert invoice_after.json()["status"] == "active"
+    receipt_after = client.get(f"/api/payments/{receipt['id']}")
+    assert receipt_after.json()["invoice_allocations"][0]["allocated_amount"] == 236
+
+
+def test_cancelling_invoice_after_allocation_removed_succeeds(client):
+    ledger_id = _payment_ledger(client, "Cancel Guard Removed Ledger")
+    invoice, receipt = _invoice_with_full_receipt(client, ledger_id)
+
+    # Unallocate the receipt from the invoice first (as the UI would require).
+    update = client.put(
+        f"/api/payments/{receipt['id']}",
+        json={
+            "voucher_type": "receipt",
+            "amount": 236,
+            "mode": "cash",
+            "invoice_allocations": [],
+        },
+    )
+    assert update.status_code == 200, update.text
+
+    response = client.delete(f"/api/invoices/{invoice['id']}")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancelled"
+
+    # The now-unallocated receipt can still be saved and reused elsewhere.
+    resave = client.put(
+        f"/api/payments/{receipt['id']}",
+        json={"voucher_type": "receipt", "amount": 236, "mode": "cash"},
+    )
+    assert resave.status_code == 200, resave.text
+
+
+def test_invoice_not_active_error_names_invoice_number_not_id(client, db_session):
+    """Legacy data (cancelled before this guard existed) should still report a
+    useful error — the invoice number, not the internal id — if a save is
+    attempted against it."""
+    ledger_id = _payment_ledger(client, "Legacy Cancelled Ledger")
+    invoice, receipt = _invoice_with_full_receipt(client, ledger_id)
+
+    stored_invoice = db_session.get(Invoice, invoice["id"])
+    stored_invoice.status = "cancelled"
+    db_session.commit()
+
+    response = client.put(
+        f"/api/payments/{receipt['id']}",
+        json={
+            "voucher_type": "receipt",
+            "amount": 236,
+            "mode": "cash",
+            "invoice_allocations": [
+                {"invoice_id": invoice["id"], "allocated_amount": 236}
+            ],
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == f"Invoice {invoice['invoice_number']} is not active"
 
 
 def test_update_existing_mismatched_payment_keeps_same_day_and_edits_amount(client, db_session, payment_in_old_fy):

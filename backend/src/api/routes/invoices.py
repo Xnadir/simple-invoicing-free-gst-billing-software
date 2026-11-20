@@ -39,6 +39,7 @@ from src.services.gst_tax_service import india_today
 from src.services.invoice_payments import (
     build_invoice_payment_summaries,
     invoice_has_tds_allocated,
+    payment_allocated_to_invoice,
     outstanding_due_invoices as _outstanding_due_invoices,
 )
 from src.services.pdf_templates import (
@@ -937,6 +938,17 @@ def cancel_invoice(
             raise HTTPException(
                 status_code=400,
                 detail=f"TDS is recorded against this invoice. Remove the TDS from the {side} first, then cancel the invoice.",
+            )
+        # A receipt/payment still allocated here would be left pointing at a
+        # cancelled invoice: it couldn't be saved again, and the allocation
+        # couldn't be removed from the page either (#792).
+        allocated_payment = payment_allocated_to_invoice(db, invoice.id)
+        if allocated_payment is not None:
+            side = "receipt" if allocated_payment.voucher_type == "receipt" else "payment"
+            voucher_number = allocated_payment.payment_number or allocated_payment.id
+            raise HTTPException(
+                status_code=400,
+                detail=f"Remove this invoice from {side} {voucher_number} first",
             )
         processor = InvoiceProcessor(db)
         # Serials first: cancelling a purchase whose units are already sold is

@@ -185,12 +185,26 @@ def test_cancelling_an_invoice_with_tds_is_blocked(client, db_session, sections)
     assert "Remove the TDS from the receipt first" in response.json()["detail"]
     assert get_invoice(client, invoice["id"])["status"] == "active"
 
-    # Once the TDS is removed from the receipt, the invoice can be cancelled.
+    # Removing the TDS still leaves the receipt's cash allocated in full to
+    # this invoice, so the TDS guard clears but the allocation guard (#792)
+    # now takes over with its own message.
     response = client.put(f"/api/payments/{receipt['id']}", json={
         "voucher_type": "receipt",
         "amount": 108000,
         "date": "2026-05-20T10:00:00",
         "invoice_allocations": [{"invoice_id": invoice["id"], "allocated_amount": 108000}],
+    })
+    assert response.status_code == 200, response.text
+    response = client.delete(f"/api/invoices/{invoice['id']}")
+    assert response.status_code == 400
+    assert f"Remove this invoice from receipt {receipt['payment_number']} first" in response.json()["detail"]
+
+    # Only once the allocation itself is cleared can the invoice be cancelled.
+    response = client.put(f"/api/payments/{receipt['id']}", json={
+        "voucher_type": "receipt",
+        "amount": 108000,
+        "date": "2026-05-20T10:00:00",
+        "invoice_allocations": [],
     })
     assert response.status_code == 200, response.text
     assert client.delete(f"/api/invoices/{invoice['id']}").status_code == 200

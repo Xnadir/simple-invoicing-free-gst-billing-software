@@ -402,7 +402,10 @@ def _validate_payment_allocations_detailed(
         if invoice.ledger_id != ledger_id:
             raise HTTPException(status_code=400, detail=f"Invoice {invoice.id} does not belong to ledger {ledger_id}")
         if invoice.status != "active":
-            raise HTTPException(status_code=400, detail=f"Invoice {invoice.id} is not active")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invoice {invoice.invoice_number or invoice.id} is not active",
+            )
         if invoice.voucher_type != expected_invoice_type:
             raise HTTPException(
                 status_code=400,
@@ -501,4 +504,25 @@ def invoice_has_tds_allocated(db: Session, invoice_id: int) -> bool:
         )
         .first()
         is not None
+    )
+
+
+def payment_allocated_to_invoice(db: Session, invoice_id: int) -> Payment | None:
+    """The first active receipt/payment allocated to this invoice, if any (#792).
+
+    Cancelling an invoice that a receipt/payment is still allocated to would
+    leave that voucher pointing at a cancelled invoice: it could no longer be
+    saved (``validate_payment_allocations`` refuses a non-active invoice), and
+    the allocation list only offers outstanding invoices, so it could not be
+    unticked either. Refusing the cancellation here, like the credit-note and
+    TDS guards above, keeps that from happening.
+    """
+    return (
+        db.query(Payment)
+        .join(PaymentInvoiceAllocation, PaymentInvoiceAllocation.payment_id == Payment.id)
+        .filter(
+            Payment.status == "active",
+            PaymentInvoiceAllocation.invoice_id == invoice_id,
+        )
+        .first()
     )
