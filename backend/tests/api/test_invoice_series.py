@@ -366,3 +366,58 @@ def test_active_format_is_refused_when_a_past_years_label_breaks_it(client, db_s
 
     assert response.status_code == 400
     assert "OLD YEAR 2024-25" in response.json()["detail"]
+
+
+def _two_years_with_invoices(client, dates, year_format=None, db=None):
+    """Two FYs through the API, then one sales invoice per (date) -> numbers."""
+    for label, start, end in (
+        ("2026-27", "2026-04-01", "2027-03-31"),
+        ("2027-28", "2027-04-01", "2028-03-31"),
+    ):
+        created = client.post("/api/financial-years/", json={
+            "label": label, "start_date": start, "end_date": end,
+        })
+        assert created.status_code == 201, created.text
+        if label == "2026-27":
+            assert client.put(f"/api/financial-years/{created.json()['id']}/activate").status_code == 200
+    if year_format:
+        for row in db.query(InvoiceSeries).all():
+            row.year_format = year_format
+        db.commit()
+    product = client.post("/api/products/", json={
+        "sku": "FYSERIES", "name": "Service", "price": 1, "gst_rate": 0,
+        "maintain_inventory": False,
+    })
+    assert product.status_code == 200, product.text
+    ledger = client.post("/api/ledgers/", json={
+        "name": "Customer", "address": "1 Market St", "phone_number": "1234567890",
+    })
+    assert ledger.status_code == 200, ledger.text
+    numbers = []
+    for invoice_date in dates:
+        invoice = client.post("/api/invoices/", json={
+            "voucher_type": "sales", "ledger_id": ledger.json()["id"],
+            "invoice_date": invoice_date,
+            "items": [{"product_id": product.json()["id"], "quantity": 1, "unit_price": 1, "gst_rate": 0}],
+        })
+        assert invoice.status_code == 200, invoice.text
+        numbers.append(invoice.json()["invoice_number"])
+    return numbers
+
+
+def test_year_part_is_the_financial_years_start_year_and_next_year_has_no_gap(client):
+    numbers = _two_years_with_invoices(client, [
+        "2026-04-10", "2026-12-15", "2027-01-05", "2027-03-31",
+        "2027-04-01", "2027-04-02", "2027-12-01",
+    ])
+    assert numbers == [
+        "INV-2026-001", "INV-2026-002", "INV-2026-003", "INV-2026-004",
+        "INV-2027-001", "INV-2027-002", "INV-2027-003",
+    ]
+
+
+def test_month_year_format_uses_the_financial_years_start_year(client, db_session):
+    numbers = _two_years_with_invoices(
+        client, ["2027-01-05", "2027-04-02"], year_format="MM-YYYY", db=db_session
+    )
+    assert numbers == ["INV-01-2026-001", "INV-04-2027-001"]

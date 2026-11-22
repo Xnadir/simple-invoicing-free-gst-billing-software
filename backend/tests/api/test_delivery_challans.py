@@ -54,7 +54,8 @@ def _post(client, body):
 def test_create_with_defaults(setup):
     s = setup
     challan = create_challan(s.client, s.ledger, [(s.product, 2)])
-    year = india_today().year
+    # The seeded financial year starts in January of last year, and the year part is its start year.
+    year = india_today().year - 1
     assert challan["challan_number"] == f"DC-{year}-001"
     assert challan["status"] == "open"
     assert challan["purpose"] == "supply_on_approval"
@@ -144,7 +145,8 @@ def test_a_number_in_use_is_refused_and_nothing_moves(setup):
 
 def test_the_series_skips_numbers_typed_by_hand(setup):
     s = setup
-    year = india_today().year
+    # The seeded financial year starts in January of last year, and the year part is its start year.
+    year = india_today().year - 1
     create_challan(s.client, s.ledger, [(s.product, 1)], challan_number=f"DC-{year}-001")
     auto = create_challan(s.client, s.ledger, [(s.product, 1)])
     assert auto["challan_number"] == f"DC-{year}-002"
@@ -166,7 +168,7 @@ def test_a_series_too_long_for_rule_55_is_refused_with_advice(client):
     response = _post(client, challan_payload(ledger, [(product, 1)]))
     assert response.status_code == 400
     detail = response.json()["detail"]
-    assert detail.startswith(f"The delivery challan series gives numbers like DELIVERY-CHALLAN-{india_today().year}-001")
+    assert detail.startswith(f"The delivery challan series gives numbers like DELIVERY-CHALLAN-{india_today().year - 1}-001")
     assert detail.endswith("Shorten the format in Settings > Company, or type a number.")
     # Typing one still works.
     ok(_post(client, challan_payload(ledger, [(product, 1)], challan_number="DC-1")))
