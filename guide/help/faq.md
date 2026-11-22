@@ -87,6 +87,11 @@ On a self-hosted copy, [add a configuration and set it as active](../settings/em
 **Did my email send?**
 Check [Email History](../settings/email#email-history). The dialog simply closes on success.
 
+## Choosing software
+
+**How does Simple Invoicing compare with Vyapar, myBillBook, Zoho and Tally?**
+See [Free GST billing software compared](./free-billing-software-comparison).
+
 ## Still stuck?
 
 Click **Request a feature or report a bug** at the top of any page, or [open an issue on GitHub](https://github.com/nikhilb2/simple-invoicing-free-gst-billing-software/issues). Please describe what you did and what you saw, and do not post customer details in the issue, because issues are public.
