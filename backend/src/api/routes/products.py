@@ -14,6 +14,7 @@ from decimal import Decimal
 from src.db.session import get_db
 from src.models.bom import BillOfMaterial
 from src.models.company import CompanyProfile
+from src.models.credit_note import CreditNote, CreditNoteItem
 from src.models.inventory import Inventory
 from src.models.invoice import Invoice, InvoiceItem
 from src.models.marketplace import MarketplaceListing, MarketplaceOrder, MarketplaceOrderItem, MarketplaceProductLink
@@ -412,6 +413,17 @@ def delete_product(
     )
     if has_invoice_items:
         raise HTTPException(status_code=400, detail="Cannot delete product linked to invoices")
+
+    # A cancelled note keeps its items (#800), even once its invoice is edited
+    # to drop the product.
+    has_credit_note_items = (
+        db.query(CreditNoteItem.id)
+        .join(CreditNote, CreditNoteItem.credit_note_id == CreditNote.id)
+        .filter(CreditNoteItem.product_id == product_id, CreditNote.company_id == active_company.id)
+        .first()
+    )
+    if has_credit_note_items:
+        raise HTTPException(status_code=400, detail="Cannot delete product linked to credit notes")
 
     has_quotation_items = (
         db.query(QuotationItem.id)

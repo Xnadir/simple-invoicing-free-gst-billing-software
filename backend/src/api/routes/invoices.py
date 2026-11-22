@@ -49,7 +49,7 @@ from src.services.pdf_templates import (
     _copy_label,
 )
 from src.services.invoice_creation import create_invoice_record
-from src.services.invoice_processor import InvoiceProcessor, invoice_has_credit_notes
+from src.services.invoice_processor import InvoiceProcessor, detach_cancelled_credit_notes, invoice_has_credit_notes
 from src.services.delivery_challan import (
     close_challan_after_invoice_restored,
     lock_source_challan,
@@ -715,11 +715,10 @@ def update_invoice(
                 detail="Cancelled invoices cannot be edited. Restore the invoice first.",
             )
 
-        # The items are deleted and recreated below, but credit note items
-        # point at them with no ON DELETE rule — even a cancelled note's
-        # items would fail the flush with a foreign key error. Refuse up
-        # front instead of surfacing a 500.
-        if invoice_has_credit_notes(db, invoice.id, active_only=False):
+        # The items are deleted and recreated below. An active note credits
+        # them, so the edit is refused; a cancelled note only lets go of them
+        # (detach_cancelled_credit_notes, just before they are deleted).
+        if invoice_has_credit_notes(db, invoice.id):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -803,6 +802,7 @@ def update_invoice(
             company_id=active_company.id,
         )
 
+        detach_cancelled_credit_notes(db, invoice.id)
         for item in list(invoice.items):
             db.delete(item)
         db.flush()
