@@ -47,7 +47,7 @@ Simple Invoicing is not the right tool for everyone. Pick another tool if:
 - **You need to work offline.** Vyapar, myBillBook and Zoho Invoice list desktop apps, and TallyPrime is installed on your PC. Simple Invoicing needs a browser.
 - **You want a native phone app.** Vyapar, myBillBook and Zoho Invoice list Android and iOS apps. Simple Invoicing works in the phone's browser only.
 - **Your accountant already works in Tally.** Tally is widely used by accountants and is deeper on accounting. Simple Invoicing does not yet do payroll, multi-currency or a full balance sheet.
-- **You want a vendor to support you.** Paid products come with a company behind them. Simple Invoicing is community-run open source software.
+- **You want a large vendor with a support team.** Paid products come with a bigger company behind them. Simple Invoicing is a small open source project, and help comes through GitHub issues and the guide.
 - **You need a feature that is not here yet.** See the roadmap in the [README](https://github.com/nikhilb2/simple-invoicing-free-gst-billing-software#roadmap). Recurring invoices, for example, are still planned.
 
 Simple Invoicing fits well if you want free software with no per-user fee, want to own your data, want to self-host, or want to ask an AI assistant about your books.
